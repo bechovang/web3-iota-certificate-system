@@ -101,5 +101,8 @@ iota client object <ITEM_ID>
 *   *Passionate about Web3 & Blockchain Technology.*
 *   *Focusing on Real-world Assets (RWA) and Identity solutions on IOTA/Sui.*
 
+## contract address
+<img width="3072" height="1610" alt="{54ACEA4A-4BEE-4F32-B14E-30CB588A2413}" src="https://github.com/user-attachments/assets/d82226b9-2928-46c4-9356-47a8b65b4c30" />
+https://explorer.iota.org/object/0x320c4891494c7d91998d1345cee197e2f95029e1ddaef2a004d92ff3e07b5dbe?network=testnet
 ---
 *Built with ❤️ on IOTA Network.*
