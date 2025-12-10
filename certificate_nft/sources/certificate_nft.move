@@ -3,178 +3,205 @@ module certificate_nft::verimove {
     use iota::event;
     use iota::clock::{Self, Clock};
     
-    // Đã xóa hết các dòng use thừa để không bị warning (IOTA tự có sẵn object, transfer, tx_context)
+    // --- MÃ LỖI ---
+    const E_NOT_AUTHORIZED: u64 = 1;
+    const E_ALREADY_VERIFIED: u64 = 2;
+    const E_ALREADY_REVOKED: u64 = 3;
 
-    // --- CẤU HÌNH ĐIỂM SỐ ---
-    const BASE_SCORE: u64 = 50;       // Điểm khởi đầu cho trường uy tín
-    const MAX_SCORE: u64 = 100;       // Điểm tối đa
-    const SCORE_PER_VERIFY: u64 = 5;  // Cộng 5 điểm mỗi lần verify
+    // --- STRUCTS ---
 
-    // --- MÃ LỖI (Để debug) ---
-    const E_NOT_AUTHORIZED: u64 = 1;  // Lỗi: Không có quyền
-    const E_CREDENTIAL_REVOKED: u64 = 2; // Lỗi: Bằng đã bị thu hồi
-
-    // --- STRUCTS (Cấu trúc dữ liệu) ---
-
-    /// 1. ISSUER (Hồ sơ Trường học/Tổ chức)
-    /// Object này là Shared Object (Ai cũng xem được thông tin trường)
-    public struct Issuer has key, store {
+    /// 0. ADMIN CAP (Quyền lực tối cao của hệ thống VeriMove)
+    /// Chỉ có ví người Deploy (Bạn) mới giữ cái này.
+    /// Dùng để tích xanh (Verify) cho các Tổ chức.
+    public struct VeriMoveAdminCap has key, store {
         id: UID,
-        name: String,        // Tên trường (VD: FPT University)
-        website: String,     // Website
-        total_issued: u64,   // Tổng số bằng đã cấp
-        admin_addr: address, // Địa chỉ ví Admin của trường
     }
 
-    /// 2. ISSUER CAP (Con dấu quyền lực)
-    /// Chỉ Admin giữ cái này mới được quyền gọi hàm cấp bằng.
-    public struct IssuerCap has key, store {
+    /// 1. PROFILE TỔ CHỨC (Organization)
+    public struct Organization has key, store {
         id: UID,
-        // FIX: Đổi từ address -> ID để khớp dữ liệu
-        issuer_id: ID, // Link tới hồ sơ Issuer ở trên (lưu Object ID)
+        name: String,        // Tên tổ chức (VD: Google, FPT)
+        industry: String,    // Ngành nghề
+        image_url: String,   // Logo
+        admin_addr: address, // Ví admin của công ty
+        is_verified: bool,   // TRẠNG THÁI KYC (True = Có tích xanh)
     }
 
-    /// 3. CREDENTIAL (Bằng cấp Soulbound)
-    /// QUAN TRỌNG: Chỉ có 'key', KHÔNG CÓ 'store' => Không thể bán/chuyển nhượng.
-    public struct Credential has key {
+    /// 2. ORG CAP (Con dấu của Tổ chức)
+    public struct OrgCap has key, store {
         id: UID,
-        holder_name: String,     // Tên sinh viên
-        credential_type: String, // Loại bằng
-        issue_date: u64,         // Ngày cấp (Timestamp)
-        issuer_name: String,     // Tên trường cấp
+        org_id: ID, 
+    }
+
+    /// 3. CAREER ITEM (Mục CV - Soulbound)
+    public struct CareerItem has key {
+        id: UID,
+        // -- Thông tin --
+        holder_name: String,     
+        title: String,           
+        org_name: String,        
+        category: String,        
+        start_date: String,      
+        end_date: String,        
+        description: String,     
         
-        // --- DYNAMIC FIELDS (Dữ liệu động) ---
-        trust_score: u64,        // Điểm tin cậy (Thay đổi được)
-        verification_count: u64, // Số lần verify (Thay đổi được)
-        last_verified_at: u64,   // Thời gian verify gần nhất
-        status: u8,              // 0: Active, 1: Revoked
+        // -- Dữ liệu xác thực --
+        issue_date: u64,         
+        issuer_id: ID,           
+        status: u8,              // 0: Active (Hiệu lực), 1: Revoked (Đã thu hồi)
     }
 
-    // --- EVENTS (Bắn tín hiệu ra ngoài cho Web bắt) ---
-    public struct CredentialMinted has copy, drop {
-        // FIX: Đổi từ address -> ID để khớp với object::uid_to_inner()
-        id: ID,        // Object ID của credential vừa mint
-        holder: address, // Địa chỉ ví của người nhận bằng
+    // --- EVENTS ---
+    
+    // Sự kiện khi Tổ chức đăng ký
+    public struct OrgRegistered has copy, drop {
+        org_id: ID,
+        name: String,
     }
 
-    public struct CredentialVerified has copy, drop {
-        // FIX: Đổi từ address -> ID để khớp với object::uid_to_inner()
-        id: ID,        // Object ID của credential vừa verify
-        new_score: u64, // Điểm trust score mới sau khi verify
+    // Sự kiện khi Admin Verify tổ chức (KYC thành công)
+    public struct OrgVerified has copy, drop {
+        org_id: ID,
     }
 
-    // --- FUNCTIONS (Chức năng) ---
+    // Sự kiện khi cấp bằng
+    public struct ItemIssued has copy, drop {
+        id: ID,
+        holder: address,
+        org_name: String,
+        title: String,
+        org_verified: bool, // Frontend dựa vào đây hiện Badge xanh ngay lập tức
+    }
 
-    /// Init: Hàm khởi tạo mặc định (có thể để trống)
-    fun init(_ctx: &mut TxContext) {}
+    // Sự kiện khi thu hồi bằng
+    public struct ItemRevoked has copy, drop {
+        id: ID,
+        reason: String,
+    }
 
-    /// BƯỚC 1: Đăng ký trường học (Tạo Issuer)
-    public entry fun register_issuer(
+    // --- FUNCTIONS ---
+
+    /// Init: Khởi tạo AdminCap cho người deploy contract
+    fun init(ctx: &mut TxContext) {
+        let admin_cap = VeriMoveAdminCap {
+            id: object::new(ctx),
+        };
+        transfer::transfer(admin_cap, tx_context::sender(ctx));
+    }
+
+    // --- CÁC HÀM CHO TỔ CHỨC ---
+
+    /// BƯỚC 1: Tổ chức đăng ký (Mặc định chưa verify)
+    public entry fun register_organization(
         name: vector<u8>,
-        website: vector<u8>,
+        industry: vector<u8>,
+        image_url: vector<u8>,
         ctx: &mut TxContext
     ) {
         let sender = tx_context::sender(ctx);
-        // Tạo ID mới
         let uid = object::new(ctx);
-        // Lấy ID của object vừa tạo (kiểu ID, không phải address)
-        let issuer_id = object::uid_to_inner(&uid);
+        let org_id = object::uid_to_inner(&uid);
 
-        // Tạo hồ sơ trường
-        let issuer = Issuer {
+        let org = Organization {
             id: uid,
             name: string::utf8(name),
-            website: string::utf8(website),
-            total_issued: 0,
+            industry: string::utf8(industry),
+            image_url: string::utf8(image_url),
             admin_addr: sender,
+            is_verified: false, // Mặc định là FALSE (Chưa có tích xanh)
         };
 
-        // Tạo con dấu (Cap)
-        let issuer_cap = IssuerCap {
+        let cap = OrgCap {
             id: object::new(ctx),
-            issuer_id, // Bây giờ khớp kiểu ID rồi, không lỗi nữa
+            org_id,
         };
 
-        // Share hồ sơ trường cho cộng đồng xem
-        transfer::share_object(issuer);
-        // Gửi con dấu về ví người đăng ký
-        transfer::transfer(issuer_cap, sender);
-    }
-
-    /// BƯỚC 2: Cấp bằng (Mint)
-    /// Cần: Hồ sơ trường, Con dấu, Clock (thời gian), thông tin sinh viên
-    public entry fun issue_credential(
-        issuer: &mut Issuer,      // Update số lượng bằng
-        _cap: &IssuerCap,         // Check quyền Admin
-        clock: &Clock,            // Lấy giờ hệ thống (0x6)
-        holder_name: vector<u8>,
-        credential_type: vector<u8>,
-        recipient: address,       // Ví sinh viên
-        ctx: &mut TxContext
-    ) {
-        // Kiểm tra xem người gọi hàm có phải là admin của trường không
-        assert!(issuer.admin_addr == tx_context::sender(ctx), E_NOT_AUTHORIZED);
-
-        let current_time = clock::timestamp_ms(clock);
-        
-        // Tạo bằng mới
-        let credential = Credential {
-            id: object::new(ctx),
-            holder_name: string::utf8(holder_name),
-            credential_type: string::utf8(credential_type),
-            issue_date: current_time,
-            issuer_name: issuer.name,
-            
-            // Khởi tạo chỉ số Dynamic
-            trust_score: BASE_SCORE, // Bắt đầu là 50
-            verification_count: 0,
-            last_verified_at: 0,
-            status: 0, // Active
-        };
-
-        // Tăng bộ đếm của trường
-        issuer.total_issued = issuer.total_issued + 1;
-
-        // Bắn event
-        event::emit(CredentialMinted {
-            id: object::uid_to_inner(&credential.id), // Khớp kiểu ID
-            holder: recipient,
+        event::emit(OrgRegistered {
+            org_id,
+            name: org.name,
         });
 
-        // Gửi bằng cho sinh viên
-        transfer::transfer(credential, recipient);
+        transfer::share_object(org); 
+        transfer::transfer(cap, sender); 
     }
 
-    /// BƯỚC 3: Xác minh (Verify) - Tăng điểm Trust Score
-    public entry fun verify_credential(
-        cred: &mut Credential,
-        clock: &Clock,
-        _ctx: &mut TxContext
+    /// BƯỚC 2: Cấp bằng/Xác nhận kinh nghiệm
+    public entry fun issue_career_item(
+        org: &Organization,       
+        _cap: &OrgCap,            
+        clock: &Clock,            
+        holder_name: vector<u8>,
+        title: vector<u8>,        
+        category: vector<u8>,     
+        start_date: vector<u8>,   
+        end_date: vector<u8>,     
+        description: vector<u8>,  
+        recipient: address,       
+        ctx: &mut TxContext
     ) {
-        // Kiểm tra bằng có bị thu hồi không
-        assert!(cred.status == 0, E_CREDENTIAL_REVOKED);
+        // Chỉ admin công ty mới được cấp
+        assert!(org.admin_addr == tx_context::sender(ctx), E_NOT_AUTHORIZED);
 
         let current_time = clock::timestamp_ms(clock);
-
-        // Logic tăng điểm: Cộng dồn số lần verify
-        cred.verification_count = cred.verification_count + 1;
-        cred.last_verified_at = current_time;
-
-        // Biến này có 'mut' nên thay đổi được
-        let mut new_score = cred.trust_score + SCORE_PER_VERIFY;
+        let org_name_str = org.name;
         
-        // Nếu vượt quá điểm tối đa, giới hạn ở MAX_SCORE
-        if (new_score > MAX_SCORE) {
-            new_score = MAX_SCORE;
+        let item = CareerItem {
+            id: object::new(ctx),
+            holder_name: string::utf8(holder_name),
+            title: string::utf8(title),
+            org_name: org_name_str,
+            category: string::utf8(category),
+            start_date: string::utf8(start_date),
+            end_date: string::utf8(end_date),
+            description: string::utf8(description),
+            issue_date: current_time,
+            issuer_id: object::uid_to_inner(&org.id),
+            status: 0, // 0 = Active
         };
-        
-        // Gán giá trị mới vào struct
-        cred.trust_score = new_score;
 
-        // Bắn event cập nhật điểm
-        event::emit(CredentialVerified {
-            id: object::uid_to_inner(&cred.id), // Khớp kiểu ID
-            new_score: cred.trust_score,
+        event::emit(ItemIssued {
+            id: object::uid_to_inner(&item.id),
+            holder: recipient,
+            org_name: org_name_str,
+            title: item.title,
+            org_verified: org.is_verified, // Bắn trạng thái verify ra event
+        });
+
+        transfer::transfer(item, recipient);
+    }
+
+    /// BƯỚC 3: Thu hồi bằng (Khi nhân viên bị sa thải hoặc bằng cấp sai)
+    public entry fun revoke_career_item(
+        _cap: &OrgCap,           // Phải có con dấu
+        item: &mut CareerItem,   // Object bằng cấp cần sửa
+        reason: vector<u8>,
+        _ctx: &mut TxContext
+    ) {
+        // Kiểm tra xem con dấu có khớp với nơi cấp bằng không
+        // (Tránh việc công ty A đi thu hồi bằng của công ty B)
+        assert!(_cap.org_id == item.issuer_id, E_NOT_AUTHORIZED);
+        assert!(item.status == 0, E_ALREADY_REVOKED);
+
+        item.status = 1; // 1 = Revoked
+
+        event::emit(ItemRevoked {
+            id: object::uid_to_inner(&item.id),
+            reason: string::utf8(reason),
+        });
+    }
+
+    // --- CÁC HÀM CHO ADMIN HỆ THỐNG (BẠN) ---
+
+    /// KYC: Xác thực tổ chức (Cấp tích xanh)
+    public entry fun verify_organization(
+        _admin: &VeriMoveAdminCap, // Phải có quyền Admin hệ thống
+        org: &mut Organization,    // Object tổ chức cần verify
+        _ctx: &mut TxContext
+    ) {
+        org.is_verified = true;
+
+        event::emit(OrgVerified {
+            org_id: object::uid_to_inner(&org.id),
         });
     }
 }
